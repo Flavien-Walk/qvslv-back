@@ -17,7 +17,10 @@ mongoose.connect(process.env.MONGO_URI)
 
 // Routes
 const chatRoutes = require("./routes/chat");
+const userRoutes = require("./routes/user");
+
 app.use("/chat", chatRoutes);
+app.use("/user", userRoutes);
 
 // Lancer le serveur
 app.listen(PORT, () => {
