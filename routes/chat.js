@@ -16,12 +16,12 @@ router.get("/", async (req, res) => {
 // POST /chat — Envoyer un message
 router.post("/", async (req, res) => {
   try {
-    const { content, pseudo, color } = req.body;
+    const { content, pseudo, color, userId } = req.body;
     if (!content || !pseudo || !color) {
       return res.status(400).json({ error: "Contenu, pseudo et couleur sont requis." });
     }
 
-    const message = new Message({ content, pseudo, color });
+    const message = new Message({ content, pseudo, color, userId });
     await message.save();
 
     res.status(201).json(message);
