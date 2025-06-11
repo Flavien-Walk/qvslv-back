@@ -6,10 +6,10 @@ const Message = require("../models/Message");
 router.get("/", async (req, res) => {
   try {
     const messages = await Message.find().sort({ createdAt: 1 });
-    res.json(messages);
+    res.json(messages);  // Toujours retourner un tableau
   } catch (error) {
     console.error("Erreur lors de la récupération des messages :", error);
-    res.status(500).json({ error: "Erreur serveur." });
+    res.status(500).json([]);  // Réponse vide en cas d'erreur
   }
 });
 
