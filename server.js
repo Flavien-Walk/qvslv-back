@@ -84,12 +84,11 @@ const generalLimiter = rateLimit({
 app.use('/api/auth', authLimiter);
 app.use('/api/', generalLimiter);
 
-// Schéma utilisateur (existant)
 const userSchema = new mongoose.Schema({
   username: {
     type: String,
     required: [true, 'Le nom d\'utilisateur est requis'],
-    unique: true,
+    unique: true, // Crée déjà un index unique
     trim: true,
     minlength: [3, 'Le nom d\'utilisateur doit contenir au moins 3 caractères'],
     maxlength: [30, 'Le nom d\'utilisateur ne peut pas dépasser 30 caractères'],
@@ -98,7 +97,7 @@ const userSchema = new mongoose.Schema({
   email: {
     type: String,
     required: [true, 'L\'email est requis'],
-    unique: true,
+    unique: true, // Crée aussi un index unique
     lowercase: true,
     trim: true,
     match: [/^\S+@\S+\.\S+$/, 'Format d\'email invalide']
@@ -146,6 +145,7 @@ const userSchema = new mongoose.Schema({
   timestamps: true
 });
 
+
 // Schéma des salons de chat
 const chatRoomSchema = new mongoose.Schema({
   name: {
@@ -179,6 +179,7 @@ const chatRoomSchema = new mongoose.Schema({
 }, {
   timestamps: true
 });
+
 
 // Schéma des messages
 const messageSchema = new mongoose.Schema({
@@ -274,7 +275,7 @@ activitySchema.index({ userId: 1, timestamp: -1 });
 activitySchema.index({ userId: 1, type: 1 });
 messageSchema.index({ chatRoom: 1, createdAt: -1 });
 messageSchema.index({ author: 1 });
-chatRoomSchema.index({ name: 1 });
+
 
 // Middleware pour hasher le mot de passe (existant)
 userSchema.pre('save', async function(next) {
@@ -959,13 +960,13 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
 const initializeDefaultRooms = async () => {
   try {
     const existingRooms = await ChatRoom.countDocuments();
-    
+
     if (existingRooms === 0) {
       // Créer un utilisateur système si nécessaire
-      let systemUser = await User.findOne({ username: 'SYSTÈME' });
+      let systemUser = await User.findOne({ username: 'SYSTEM' });
       if (!systemUser) {
         systemUser = new User({
-          username: 'SYSTÈME',
+          username: 'SYSTEM',
           email: 'system@qvslv.com',
           password: 'SystemPassword123!',
           role: 'admin',
@@ -1021,6 +1022,7 @@ const initializeDefaultRooms = async () => {
     console.error('❌ Erreur lors de la création des salons par défaut:', error);
   }
 };
+
 
 // Route pour récupérer les statistiques utilisateur (existante)
 app.get('/api/user/stats', authenticateToken, async (req, res) => {
