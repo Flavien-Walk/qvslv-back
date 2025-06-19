@@ -22,10 +22,36 @@ if (!MONGO_URI) {
 
 // Middleware de sécurité
 app.use(helmet());
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:8081',
+  'http://localhost:19006',
+  'https://qvslv-front.onrender.com',
+  'https://www.qvslv.com', // domaine final si tu en as un
+];
+
+
+// Middleware CORS propre
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: function (origin, callback) {
+    // Autoriser Postman, curl, etc. (pas d'origine)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`❌ CORS refusé pour : ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true
 }));
+
+// Headers manuels pour pré-requêtes OPTIONS
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  next();
+});
+
+
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
