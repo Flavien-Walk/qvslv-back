@@ -6,9 +6,25 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
+const http = require("http");
+const socketIo = require("socket.io");
 require("dotenv").config();
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: [
+      'http://localhost:3000',
+      'http://localhost:8081',
+      'http://localhost:19006',
+      'https://qvslv-front.onrender.com',
+      'https://www.qvslv.com',
+    ],
+    methods: ["GET", "POST"]
+  }
+});
+
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
@@ -30,7 +46,6 @@ const allowedOrigins = [
   'https://www.qvslv.com',
 ];
 
-// Middleware CORS propre
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
@@ -43,7 +58,6 @@ app.use(cors({
   credentials: true
 }));
 
-// Headers manuels pour pré-requêtes OPTIONS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   next();
@@ -53,16 +67,16 @@ app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 tentatives par IP
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   message: { error: "Trop de tentatives de connexion. Réessayez dans 15 minutes." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requêtes par IP
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -70,7 +84,7 @@ const generalLimiter = rateLimit({
 app.use('/api/auth', authLimiter);
 app.use('/api/', generalLimiter);
 
-// Schéma utilisateur
+// Schéma utilisateur (existant)
 const userSchema = new mongoose.Schema({
   username: {
     type: String,
@@ -94,9 +108,26 @@ const userSchema = new mongoose.Schema({
     required: [true, 'Le mot de passe est requis'],
     minlength: [8, 'Le mot de passe doit contenir au moins 8 caractères']
   },
+  role: {
+    type: String,
+    enum: ['member', 'moderator', 'expert', 'admin'],
+    default: 'member'
+  },
   isVerified: {
     type: Boolean,
     default: false
+  },
+  verified: {
+    type: Boolean,
+    default: false
+  },
+  isOnline: {
+    type: Boolean,
+    default: false
+  },
+  lastSeen: {
+    type: Date,
+    default: Date.now
   },
   verificationToken: String,
   resetPasswordToken: String,
@@ -115,7 +146,100 @@ const userSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Schéma pour les activités utilisateur
+// Schéma des salons de chat
+const chatRoomSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  description: String,
+  category: String,
+  isPrivate: {
+    type: Boolean,
+    default: false
+  },
+  verified: {
+    type: Boolean,
+    default: false
+  },
+  members: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
+  moderators: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  }
+}, {
+  timestamps: true
+});
+
+// Schéma des messages
+const messageSchema = new mongoose.Schema({
+  content: {
+    type: String,
+    required: true,
+    maxlength: 2000
+  },
+  author: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  chatRoom: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'ChatRoom',
+    required: true
+  },
+  replyTo: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Message'
+  },
+  mentions: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
+  reactions: [{
+    emoji: String,
+    users: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }]
+  }],
+  attachments: [{
+    type: {
+      type: String,
+      enum: ['image', 'document', 'audio']
+    },
+    url: String,
+    name: String,
+    size: Number
+  }],
+  edited: {
+    type: Boolean,
+    default: false
+  },
+  editedAt: Date,
+  isSystem: {
+    type: Boolean,
+    default: false
+  },
+  deleted: {
+    type: Boolean,
+    default: false
+  },
+  deletedAt: Date
+}, {
+  timestamps: true
+});
+
+// Schéma pour les activités utilisateur (existant)
 const activitySchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -124,7 +248,7 @@ const activitySchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['upload', 'download', 'contribution', 'login'],
+    enum: ['upload', 'download', 'contribution', 'login', 'chat_message'],
     required: true
   },
   category: {
@@ -148,8 +272,11 @@ userSchema.index({ email: 1 });
 userSchema.index({ username: 1 });
 activitySchema.index({ userId: 1, timestamp: -1 });
 activitySchema.index({ userId: 1, type: 1 });
+messageSchema.index({ chatRoom: 1, createdAt: -1 });
+messageSchema.index({ author: 1 });
+chatRoomSchema.index({ name: 1 });
 
-// Middleware pour hasher le mot de passe
+// Middleware pour hasher le mot de passe (existant)
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
   
@@ -162,30 +289,28 @@ userSchema.pre('save', async function(next) {
   }
 });
 
-// Méthode pour comparer les mots de passe
+// Méthodes utilisateur (existantes)
 userSchema.methods.comparePassword = async function(candidatePassword) {
   return bcrypt.compare(candidatePassword, this.password);
 };
 
-// Méthode pour générer le JWT
 userSchema.methods.generateAuthToken = function() {
   return jwt.sign(
     { 
       userId: this._id, 
       username: this.username,
-      email: this.email 
+      email: this.email,
+      role: this.role
     },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
 };
 
-// Méthode pour vérifier si le compte est verrouillé
 userSchema.methods.isLocked = function() {
   return !!(this.lockUntil && this.lockUntil > Date.now());
 };
 
-// Méthode pour incrémenter les tentatives de connexion
 userSchema.methods.incLoginAttempts = function() {
   if (this.lockUntil && this.lockUntil < Date.now()) {
     return this.updateOne({
@@ -197,13 +322,12 @@ userSchema.methods.incLoginAttempts = function() {
   const updates = { $inc: { loginAttempts: 1 } };
   
   if (this.loginAttempts + 1 >= 5 && !this.isLocked()) {
-    updates.$set = { lockUntil: Date.now() + 2 * 60 * 60 * 1000 }; // 2 heures
+    updates.$set = { lockUntil: Date.now() + 2 * 60 * 60 * 1000 };
   }
   
   return this.updateOne(updates);
 };
 
-// Méthode pour réinitialiser les tentatives de connexion
 userSchema.methods.resetLoginAttempts = function() {
   return this.updateOne({
     $unset: { loginAttempts: 1, lockUntil: 1 }
@@ -212,8 +336,10 @@ userSchema.methods.resetLoginAttempts = function() {
 
 const User = mongoose.model('User', userSchema);
 const Activity = mongoose.model('Activity', activitySchema);
+const ChatRoom = mongoose.model('ChatRoom', chatRoomSchema);
+const Message = mongoose.model('Message', messageSchema);
 
-// Middleware d'authentification
+// Middleware d'authentification (existant)
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -237,7 +363,7 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
-// Fonction pour enregistrer une activité
+// Fonction pour enregistrer une activité (existante)
 const logActivity = async (userId, type, category = null, details = {}) => {
   try {
     const activity = new Activity({
@@ -252,7 +378,7 @@ const logActivity = async (userId, type, category = null, details = {}) => {
   }
 };
 
-// Validation du mot de passe
+// Validation du mot de passe (existante)
 const validatePassword = (password) => {
   const minLength = 8;
   const hasUpperCase = /[A-Z]/.test(password);
@@ -284,14 +410,11 @@ const validatePassword = (password) => {
   };
 };
 
-// Routes d'authentification
-
-// Inscription
+// Routes d'authentification (existantes - je garde les principales)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, confirmPassword } = req.body;
 
-    // Validation des données
     if (!username || !email || !password || !confirmPassword) {
       return res.status(400).json({
         error: 'Tous les champs sont requis'
@@ -304,7 +427,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Validation du mot de passe
     const passwordValidation = validatePassword(password);
     if (!passwordValidation.isValid) {
       return res.status(400).json({
@@ -313,7 +435,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Vérifier si l'utilisateur existe déjà
     const existingUserByEmail = await User.findOne({ email: email.toLowerCase() });
     if (existingUserByEmail) {
       return res.status(409).json({
@@ -328,7 +449,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Créer le nouvel utilisateur
     const user = new User({
       username,
       email: email.toLowerCase(),
@@ -337,14 +457,11 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     await user.save();
-
-    // Enregistrer l'activité d'inscription
     await logActivity(user._id, 'contribution', 'inscription', {
       ip: req.ip,
       userAgent: req.get('User-Agent')
     });
 
-    // Générer le token d'authentification
     const token = user.generateAuthToken();
 
     res.status(201).json({
@@ -353,7 +470,9 @@ app.post('/api/auth/register', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
+        role: user.role,
         isVerified: user.isVerified,
+        verified: user.verified,
         createdAt: user.createdAt
       },
       token
@@ -383,7 +502,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// Connexion
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -394,7 +512,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Trouver l'utilisateur
     const user = await User.findOne({ 
       $or: [
         { email: email.toLowerCase() },
@@ -408,14 +525,12 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Vérifier si le compte est verrouillé
     if (user.isLocked()) {
       return res.status(423).json({
         error: 'Compte temporairement verrouillé en raison de trop nombreuses tentatives de connexion'
       });
     }
 
-    // Vérifier le mot de passe
     const isPasswordValid = await user.comparePassword(password);
 
     if (!isPasswordValid) {
@@ -425,22 +540,19 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Réinitialiser les tentatives de connexion en cas de succès
     if (user.loginAttempts > 0) {
       await user.resetLoginAttempts();
     }
 
-    // Mettre à jour la dernière connexion
     user.lastLogin = new Date();
+    user.isOnline = true;
     await user.save();
 
-    // Enregistrer l'activité de connexion
     await logActivity(user._id, 'login', null, {
       ip: req.ip,
       userAgent: req.get('User-Agent')
     });
 
-    // Générer le token
     const token = user.generateAuthToken();
 
     res.json({
@@ -449,7 +561,9 @@ app.post('/api/auth/login', async (req, res) => {
         id: user._id,
         username: user.username,
         email: user.email,
+        role: user.role,
         isVerified: user.isVerified,
+        verified: user.verified,
         lastLogin: user.lastLogin
       },
       token
@@ -463,7 +577,362 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Profil utilisateur (protégé)
+// NOUVELLES ROUTES POUR LE CHAT
+
+// Récupérer tous les salons de chat
+app.get('/api/chat/rooms', authenticateToken, async (req, res) => {
+  try {
+    const rooms = await ChatRoom.find({ deleted: { $ne: true } })
+      .populate('createdBy', 'username')
+      .populate('members', 'username isOnline')
+      .sort({ createdAt: -1 });
+
+    const roomsWithStats = await Promise.all(rooms.map(async (room) => {
+      const memberCount = room.members ? room.members.length : 0;
+      const onlineCount = room.members ? room.members.filter(m => m.isOnline).length : 0;
+      
+      // Récupérer le dernier message
+      const lastMessage = await Message.findOne({ 
+        chatRoom: room._id, 
+        deleted: { $ne: true } 
+      })
+        .populate('author', 'username')
+        .sort({ createdAt: -1 });
+
+      return {
+        id: room._id,
+        name: room.name,
+        description: room.description,
+        category: room.category,
+        isPrivate: room.isPrivate,
+        verified: room.verified,
+        memberCount,
+        onlineCount,
+        lastMessage: lastMessage ? {
+          author: lastMessage.author.username,
+          content: lastMessage.content,
+          timestamp: lastMessage.createdAt
+        } : null
+      };
+    }));
+
+    res.json({ rooms: roomsWithStats });
+  } catch (error) {
+    console.error('Erreur lors de la récupération des salons:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Récupérer les messages d'un salon
+app.get('/api/chat/rooms/:roomId/messages', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { limit = 50, page = 1 } = req.query;
+
+    const room = await ChatRoom.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Salon non trouvé' });
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const messages = await Message.find({ 
+      chatRoom: roomId, 
+      deleted: { $ne: true } 
+    })
+      .populate('author', 'username role verified isVerified')
+      .populate('replyTo', 'content author')
+      .populate('mentions', 'username')
+      .populate('reactions.users', 'username')
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(skip);
+
+    const formattedMessages = messages.reverse().map(message => ({
+      id: message._id,
+      userId: message.author._id,
+      username: message.author.username,
+      role: message.author.role,
+      verified: message.author.verified || message.author.isVerified,
+      content: message.content,
+      timestamp: message.createdAt,
+      edited: message.edited,
+      editedAt: message.editedAt,
+      isSystem: message.isSystem,
+      replyTo: message.replyTo,
+      mentions: message.mentions.map(m => m.username),
+      reactions: message.reactions.map(r => ({
+        emoji: r.emoji,
+        count: r.users.length,
+        users: r.users.map(u => u._id.toString())
+      })),
+      attachments: message.attachments || []
+    }));
+
+    res.json({ messages: formattedMessages });
+  } catch (error) {
+    console.error('Erreur lors de la récupération des messages:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Envoyer un message
+app.post('/api/chat/rooms/:roomId/messages', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { content, replyTo, mentions } = req.body;
+
+    if (!content || content.trim().length === 0) {
+      return res.status(400).json({ error: 'Le contenu du message est requis' });
+    }
+
+    if (content.length > 2000) {
+      return res.status(400).json({ error: 'Le message ne peut pas dépasser 2000 caractères' });
+    }
+
+    const room = await ChatRoom.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Salon non trouvé' });
+    }
+
+    const message = new Message({
+      content: content.trim(),
+      author: req.user._id,
+      chatRoom: roomId,
+      replyTo: replyTo || null,
+      mentions: mentions || []
+    });
+
+    await message.save();
+    await message.populate('author', 'username role verified isVerified');
+
+    // Enregistrer l'activité
+    await logActivity(req.user._id, 'chat_message', room.name, {
+      messageId: message._id,
+      roomId
+    });
+
+    const formattedMessage = {
+      id: message._id,
+      userId: message.author._id,
+      username: message.author.username,
+      role: message.author.role,
+      verified: message.author.verified || message.author.isVerified,
+      content: message.content,
+      timestamp: message.createdAt,
+      edited: false,
+      isSystem: false,
+      reactions: [],
+      attachments: []
+    };
+
+    // Émettre le message via Socket.IO
+    io.to(`room_${roomId}`).emit('new_message', formattedMessage);
+
+    res.status(201).json({ 
+      message: 'Message envoyé avec succès',
+      data: formattedMessage
+    });
+  } catch (error) {
+    console.error('Erreur lors de l\'envoi du message:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Modifier un message
+app.put('/api/chat/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { content } = req.body;
+
+    if (!content || content.trim().length === 0) {
+      return res.status(400).json({ error: 'Le contenu du message est requis' });
+    }
+
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message non trouvé' });
+    }
+
+    if (message.author.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Vous ne pouvez modifier que vos propres messages' });
+    }
+
+    message.content = content.trim();
+    message.edited = true;
+    message.editedAt = new Date();
+    await message.save();
+
+    // Émettre la modification via Socket.IO
+    io.to(`room_${message.chatRoom}`).emit('message_edited', {
+      messageId: message._id,
+      content: message.content,
+      edited: true,
+      editedAt: message.editedAt
+    });
+
+    res.json({ message: 'Message modifié avec succès' });
+  } catch (error) {
+    console.error('Erreur lors de la modification du message:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Supprimer un message
+app.delete('/api/chat/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message non trouvé' });
+    }
+
+    // Vérifier les permissions
+    const canDelete = message.author.toString() === req.user._id.toString() || 
+                     req.user.role === 'admin' || 
+                     req.user.role === 'moderator';
+
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Permission insuffisante' });
+    }
+
+    message.deleted = true;
+    message.deletedAt = new Date();
+    await message.save();
+
+    // Émettre la suppression via Socket.IO
+    io.to(`room_${message.chatRoom}`).emit('message_deleted', {
+      messageId: message._id
+    });
+
+    res.json({ message: 'Message supprimé avec succès' });
+  } catch (error) {
+    console.error('Erreur lors de la suppression du message:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Ajouter/Retirer une réaction
+app.post('/api/chat/messages/:messageId/reactions', authenticateToken, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { emoji } = req.body;
+
+    if (!emoji) {
+      return res.status(400).json({ error: 'Emoji requis' });
+    }
+
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'Message non trouvé' });
+    }
+
+    const existingReaction = message.reactions.find(r => r.emoji === emoji);
+
+    if (existingReaction) {
+      const userIndex = existingReaction.users.indexOf(req.user._id);
+      if (userIndex > -1) {
+        // Retirer la réaction
+        existingReaction.users.splice(userIndex, 1);
+        if (existingReaction.users.length === 0) {
+          message.reactions = message.reactions.filter(r => r.emoji !== emoji);
+        }
+      } else {
+        // Ajouter l'utilisateur à la réaction
+        existingReaction.users.push(req.user._id);
+      }
+    } else {
+      // Créer une nouvelle réaction
+      message.reactions.push({
+        emoji,
+        users: [req.user._id]
+      });
+    }
+
+    await message.save();
+
+    const reactionData = message.reactions.map(r => ({
+      emoji: r.emoji,
+      count: r.users.length,
+      users: r.users.map(u => u.toString())
+    }));
+
+    // Émettre la réaction via Socket.IO
+    io.to(`room_${message.chatRoom}`).emit('message_reaction', {
+      messageId: message._id,
+      reactions: reactionData
+    });
+
+    res.json({ 
+      message: 'Réaction mise à jour',
+      reactions: reactionData
+    });
+  } catch (error) {
+    console.error('Erreur lors de la gestion de la réaction:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Récupérer les utilisateurs en ligne d'un salon
+app.get('/api/chat/rooms/:roomId/users', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+
+    const room = await ChatRoom.findById(roomId).populate('members', 'username role verified isVerified isOnline lastSeen');
+    if (!room) {
+      return res.status(404).json({ error: 'Salon non trouvé' });
+    }
+
+    const users = room.members.map(user => ({
+      id: user._id,
+      username: user.username,
+      role: user.role,
+      verified: user.verified || user.isVerified,
+      status: user.isOnline ? 'online' : 'offline'
+    }));
+
+    res.json({ users });
+  } catch (error) {
+    console.error('Erreur lors de la récupération des utilisateurs:', error);
+    res.status(500).json({ error: 'Erreur interne du serveur' });
+  }
+});
+
+// Socket.IO pour le chat en temps réel
+io.on('connection', (socket) => {
+  console.log('Utilisateur connecté:', socket.id);
+
+  socket.on('join_room', (roomId) => {
+    socket.join(`room_${roomId}`);
+    console.log(`Utilisateur ${socket.id} a rejoint le salon ${roomId}`);
+  });
+
+  socket.on('leave_room', (roomId) => {
+    socket.leave(`room_${roomId}`);
+    console.log(`Utilisateur ${socket.id} a quitté le salon ${roomId}`);
+  });
+
+  socket.on('typing_start', (data) => {
+    socket.to(`room_${data.roomId}`).emit('user_typing', {
+      username: data.username,
+      isTyping: true
+    });
+  });
+
+  socket.on('typing_stop', (data) => {
+    socket.to(`room_${data.roomId}`).emit('user_typing', {
+      username: data.username,
+      isTyping: false
+    });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Utilisateur déconnecté:', socket.id);
+  });
+});
+
+// Routes existantes (je garde les principales)
 app.get('/api/auth/profile', authenticateToken, async (req, res) => {
   try {
     res.json({
@@ -471,7 +940,9 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
         id: req.user._id,
         username: req.user.username,
         email: req.user.email,
+        role: req.user.role,
         isVerified: req.user.isVerified,
+        verified: req.user.verified,
         createdAt: req.user.createdAt,
         lastLogin: req.user.lastLogin
       }
@@ -484,43 +955,104 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Route pour récupérer les statistiques utilisateur
+// Initialiser les salons par défaut
+const initializeDefaultRooms = async () => {
+  try {
+    const existingRooms = await ChatRoom.countDocuments();
+    
+    if (existingRooms === 0) {
+      // Créer un utilisateur système si nécessaire
+      let systemUser = await User.findOne({ username: 'SYSTÈME' });
+      if (!systemUser) {
+        systemUser = new User({
+          username: 'SYSTÈME',
+          email: 'system@qvslv.com',
+          password: 'SystemPassword123!',
+          role: 'admin',
+          isVerified: true,
+          verified: true
+        });
+        await systemUser.save();
+      }
+
+      const defaultRooms = [
+        {
+          name: 'Général',
+          description: 'Discussions générales et actualités',
+          category: 'Général',
+          isPrivate: false,
+          verified: true,
+          createdBy: systemUser._id,
+          members: [systemUser._id]
+        },
+        {
+          name: 'Investigations Économiques',
+          description: 'Analyses financières et économiques approfondies',
+          category: 'Économie',
+          isPrivate: false,
+          verified: true,
+          createdBy: systemUser._id,
+          members: [systemUser._id]
+        },
+        {
+          name: 'Lanceurs d\'Alerte',
+          description: 'Espace sécurisé pour les témoignages',
+          category: 'Confidentiel',
+          isPrivate: true,
+          verified: true,
+          createdBy: systemUser._id,
+          members: [systemUser._id]
+        },
+        {
+          name: 'Vérification Sources',
+          description: 'Validation collaborative des informations',
+          category: 'Vérification',
+          isPrivate: false,
+          verified: true,
+          createdBy: systemUser._id,
+          members: [systemUser._id]
+        }
+      ];
+
+      await ChatRoom.insertMany(defaultRooms);
+      console.log('✅ Salons par défaut créés');
+    }
+  } catch (error) {
+    console.error('❌ Erreur lors de la création des salons par défaut:', error);
+  }
+};
+
+// Route pour récupérer les statistiques utilisateur (existante)
 app.get('/api/user/stats', authenticateToken, async (req, res) => {
   try {
     const userId = req.user._id;
     
-    // Récupérer les activités de l'utilisateur
     const activities = await Activity.find({ userId }).sort({ timestamp: -1 });
     
-    // Calculer les statistiques
     const stats = {
       totalContributions: 0,
       totalDownloads: 0,
       totalUploads: 0,
+      totalMessages: 0,
       accountAge: 0,
       lastActivityDate: req.user.lastLogin || req.user.createdAt,
       favoriteCategory: null
     };
 
-    // Compter les différents types d'activités
     const activityCounts = {
       contribution: 0,
       download: 0,
-      upload: 0
+      upload: 0,
+      chat_message: 0
     };
 
     const categoryCounts = {};
 
     activities.forEach(activity => {
-      if (activity.type === 'contribution') {
-        activityCounts.contribution++;
-      } else if (activity.type === 'download') {
-        activityCounts.download++;
-      } else if (activity.type === 'upload') {
-        activityCounts.upload++;
+      if (activityCounts.hasOwnProperty(activity.type)) {
+        activityCounts[activity.type]++;
       }
 
-      // Compter les catégories
       if (activity.category && activity.category !== 'inscription') {
         categoryCounts[activity.category] = (categoryCounts[activity.category] || 0) + 1;
       }
@@ -529,212 +1061,26 @@ app.get('/api/user/stats', authenticateToken, async (req, res) => {
     stats.totalContributions = activityCounts.contribution;
     stats.totalDownloads = activityCounts.download;
     stats.totalUploads = activityCounts.upload;
+    stats.totalMessages = activityCounts.chat_message;
 
-    // Calculer l'âge du compte en jours
     const accountCreated = new Date(req.user.createdAt);
     const now = new Date();
     stats.accountAge = Math.floor((now.getTime() - accountCreated.getTime()) / (1000 * 60 * 60 * 24));
 
-    // Trouver la catégorie favorite
     if (Object.keys(categoryCounts).length > 0) {
       stats.favoriteCategory = Object.keys(categoryCounts).reduce((a, b) => 
         categoryCounts[a] > categoryCounts[b] ? a : b
       );
     }
 
-    // Dernière activité
     if (activities.length > 0) {
       stats.lastActivityDate = activities[0].timestamp;
     }
 
-    res.json({
-      stats
-    });
+    res.json({ stats });
 
   } catch (error) {
     console.error('Erreur lors de la récupération des statistiques:', error);
-    res.status(500).json({
-      error: 'Erreur interne du serveur'
-    });
-  }
-});
-
-// Route pour enregistrer une activité utilisateur
-app.post('/api/user/activity', authenticateToken, async (req, res) => {
-  try {
-    const { type, category, details } = req.body;
-    const userId = req.user._id;
-
-    // Validation du type d'activité
-    const validTypes = ['upload', 'download', 'contribution', 'login'];
-    if (!validTypes.includes(type)) {
-      return res.status(400).json({
-        error: 'Type d\'activité invalide'
-      });
-    }
-
-    // Créer la nouvelle activité
-    const activity = new Activity({
-      userId,
-      type,
-      category: category || null,
-      details: details || {}
-    });
-
-    await activity.save();
-
-    res.status(201).json({
-      message: 'Activité enregistrée avec succès',
-      activity: {
-        id: activity._id,
-        type: activity.type,
-        category: activity.category,
-        timestamp: activity.timestamp
-      }
-    });
-
-  } catch (error) {
-    console.error('Erreur lors de l\'enregistrement de l\'activité:', error);
-    res.status(500).json({
-      error: 'Erreur interne du serveur'
-    });
-  }
-});
-
-// Route pour récupérer l'historique d'activités
-app.get('/api/user/activities', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { limit = 50, page = 1, type } = req.query;
-
-    // Construire la requête
-    const query = { userId };
-    if (type) {
-      query.type = type;
-    }
-
-    // Pagination
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const activities = await Activity.find(query)
-      .sort({ timestamp: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .select('type category details timestamp');
-
-    const total = await Activity.countDocuments(query);
-
-    res.json({
-      activities,
-      pagination: {
-        current: parseInt(page),
-        total: Math.ceil(total / parseInt(limit)),
-        count: activities.length,
-        totalRecords: total
-      }
-    });
-
-  } catch (error) {
-    console.error('Erreur lors de la récupération des activités:', error);
-    res.status(500).json({
-      error: 'Erreur interne du serveur'
-    });
-  }
-});
-
-// Route pour générer des données de test (à supprimer en production)
-app.post('/api/user/generate-test-data', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const categories = ['Musique', 'Vidéo', 'Documents', 'Images', 'Logiciels', 'Education', 'Gaming'];
-    const types = ['upload', 'download', 'contribution'];
-    
-    const activities = [];
-    
-    // Générer 100 activités aléatoires sur les 6 derniers mois
-    for (let i = 0; i < 100; i++) {
-      const randomDate = new Date();
-      randomDate.setDate(randomDate.getDate() - Math.floor(Math.random() * 180));
-      
-      activities.push({
-        userId,
-        type: types[Math.floor(Math.random() * types.length)],
-        category: categories[Math.floor(Math.random() * categories.length)],
-        timestamp: randomDate,
-        details: {
-          generated: true,
-          testData: true
-        }
-      });
-    }
-    
-    await Activity.insertMany(activities);
-    
-    res.json({
-      message: 'Données de test générées avec succès',
-      count: activities.length
-    });
-
-  } catch (error) {
-    console.error('Erreur lors de la génération des données de test:', error);
-    res.status(500).json({
-      error: 'Erreur interne du serveur'
-    });
-  }
-});
-
-// Vérification du token
-app.post('/api/auth/verify-token', authenticateToken, (req, res) => {
-  res.json({
-    valid: true,
-    user: {
-      id: req.user._id,
-      username: req.user.username,
-      email: req.user.email
-    }
-  });
-});
-
-// Déconnexion (côté client principalement)
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
-  res.json({ message: 'Déconnexion réussie' });
-});
-
-// Demande de réinitialisation de mot de passe
-app.post('/api/auth/forgot-password', async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({
-        error: 'Email requis'
-      });
-    }
-
-    const user = await User.findOne({ email: email.toLowerCase() });
-    
-    if (!user) {
-      // Pour des raisons de sécurité, on ne révèle pas si l'email existe
-      return res.json({
-        message: 'Si cet email existe dans notre système, vous recevrez un lien de réinitialisation'
-      });
-    }
-
-    // Générer un token de réinitialisation
-    const resetToken = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '1h' });
-    
-    user.resetPasswordToken = resetToken;
-    user.resetPasswordExpires = new Date(Date.now() + 3600000); // 1 heure
-    await user.save();
-
-    // Ici, vous devriez envoyer un email avec le lien de réinitialisation
-    
-    res.json({
-      message: 'Si cet email existe dans notre système, vous recevrez un lien de réinitialisation'
-    });
-
-  } catch (error) {
-    console.error('Erreur lors de la demande de réinitialisation:', error);
     res.status(500).json({
       error: 'Erreur interne du serveur'
     });
@@ -745,20 +1091,24 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 app.get("/api/health", (req, res) => {
   res.json({ 
     status: "OK", 
-    message: "Serveur opérationnel.",
+    message: "Serveur opérationnel avec chat.",
     timestamp: new Date().toISOString()
   });
 });
 
 // Connexion à MongoDB Atlas
 mongoose.connect(MONGO_URI)
-  .then(() => {
+  .then(async () => {
     console.log("✅ Connecté à MongoDB Atlas");
+    
+    // Initialiser les salons par défaut
+    await initializeDefaultRooms();
    
     // Lancer le serveur seulement après la connexion à la base
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`🚀 Serveur en ligne sur le port ${PORT}`);
       console.log(`🔒 JWT Secret configuré: ${JWT_SECRET ? 'Oui' : 'Non'}`);
+      console.log(`💬 Chat temps réel activé`);
       console.log(`📊 Routes statistiques activées`);
     });
   })
