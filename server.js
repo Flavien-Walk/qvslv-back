@@ -8,7 +8,8 @@ const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 require("dotenv").config();
 
-const app = express();
+const app = express()
+app.set('trust proxy', 1); // 👉 Nécessaire pour les reverse proxies comme Render;
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET || "votre_jwt_secret_ultra_securise_changez_moi";
