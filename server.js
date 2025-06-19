@@ -8,8 +8,8 @@ const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 require("dotenv").config();
 
-const app = express()
-app.set('trust proxy', 1); // 👉 Nécessaire pour les reverse proxies comme Render;
+const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET || "votre_jwt_secret_ultra_securise_changez_moi";
@@ -27,14 +27,12 @@ const allowedOrigins = [
   'http://localhost:8081',
   'http://localhost:19006',
   'https://qvslv-front.onrender.com',
-  'https://www.qvslv.com', // domaine final si tu en as un
+  'https://www.qvslv.com',
 ];
-
 
 // Middleware CORS propre
 app.use(cors({
   origin: function (origin, callback) {
-    // Autoriser Postman, curl, etc. (pas d'origine)
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -50,7 +48,6 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   next();
 });
-
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -118,9 +115,39 @@ const userSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Schéma pour les activités utilisateur
+const activitySchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  type: {
+    type: String,
+    enum: ['upload', 'download', 'contribution', 'login'],
+    required: true
+  },
+  category: {
+    type: String,
+    default: null
+  },
+  details: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
+  },
+  timestamp: {
+    type: Date,
+    default: Date.now
+  }
+}, {
+  timestamps: true
+});
+
 // Index pour améliorer les performances
 userSchema.index({ email: 1 });
 userSchema.index({ username: 1 });
+activitySchema.index({ userId: 1, timestamp: -1 });
+activitySchema.index({ userId: 1, type: 1 });
 
 // Middleware pour hasher le mot de passe
 userSchema.pre('save', async function(next) {
@@ -160,7 +187,6 @@ userSchema.methods.isLocked = function() {
 
 // Méthode pour incrémenter les tentatives de connexion
 userSchema.methods.incLoginAttempts = function() {
-  // Si on a un verrou et qu'il a expiré, on remet à zéro
   if (this.lockUntil && this.lockUntil < Date.now()) {
     return this.updateOne({
       $unset: { lockUntil: 1 },
@@ -170,7 +196,6 @@ userSchema.methods.incLoginAttempts = function() {
   
   const updates = { $inc: { loginAttempts: 1 } };
   
-  // Si on atteint 5 tentatives et qu'on n'est pas déjà verrouillé, on verrouille
   if (this.loginAttempts + 1 >= 5 && !this.isLocked()) {
     updates.$set = { lockUntil: Date.now() + 2 * 60 * 60 * 1000 }; // 2 heures
   }
@@ -186,6 +211,7 @@ userSchema.methods.resetLoginAttempts = function() {
 };
 
 const User = mongoose.model('User', userSchema);
+const Activity = mongoose.model('Activity', activitySchema);
 
 // Middleware d'authentification
 const authenticateToken = async (req, res, next) => {
@@ -208,6 +234,21 @@ const authenticateToken = async (req, res, next) => {
     next();
   } catch (error) {
     return res.status(403).json({ error: 'Token invalide ou expiré' });
+  }
+};
+
+// Fonction pour enregistrer une activité
+const logActivity = async (userId, type, category = null, details = {}) => {
+  try {
+    const activity = new Activity({
+      userId,
+      type,
+      category,
+      details
+    });
+    await activity.save();
+  } catch (error) {
+    console.error('Erreur lors de l\'enregistrement de l\'activité:', error);
   }
 };
 
@@ -296,6 +337,12 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     await user.save();
+
+    // Enregistrer l'activité d'inscription
+    await logActivity(user._id, 'contribution', 'inscription', {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    });
 
     // Générer le token d'authentification
     const token = user.generateAuthToken();
@@ -387,6 +434,12 @@ app.post('/api/auth/login', async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
+    // Enregistrer l'activité de connexion
+    await logActivity(user._id, 'login', null, {
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
     // Générer le token
     const token = user.generateAuthToken();
 
@@ -425,6 +478,205 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Erreur lors de la récupération du profil:', error);
+    res.status(500).json({
+      error: 'Erreur interne du serveur'
+    });
+  }
+});
+
+// Route pour récupérer les statistiques utilisateur
+app.get('/api/user/stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    
+    // Récupérer les activités de l'utilisateur
+    const activities = await Activity.find({ userId }).sort({ timestamp: -1 });
+    
+    // Calculer les statistiques
+    const stats = {
+      totalContributions: 0,
+      totalDownloads: 0,
+      totalUploads: 0,
+      accountAge: 0,
+      lastActivityDate: req.user.lastLogin || req.user.createdAt,
+      favoriteCategory: null
+    };
+
+    // Compter les différents types d'activités
+    const activityCounts = {
+      contribution: 0,
+      download: 0,
+      upload: 0
+    };
+
+    const categoryCounts = {};
+
+    activities.forEach(activity => {
+      if (activity.type === 'contribution') {
+        activityCounts.contribution++;
+      } else if (activity.type === 'download') {
+        activityCounts.download++;
+      } else if (activity.type === 'upload') {
+        activityCounts.upload++;
+      }
+
+      // Compter les catégories
+      if (activity.category && activity.category !== 'inscription') {
+        categoryCounts[activity.category] = (categoryCounts[activity.category] || 0) + 1;
+      }
+    });
+
+    stats.totalContributions = activityCounts.contribution;
+    stats.totalDownloads = activityCounts.download;
+    stats.totalUploads = activityCounts.upload;
+
+    // Calculer l'âge du compte en jours
+    const accountCreated = new Date(req.user.createdAt);
+    const now = new Date();
+    stats.accountAge = Math.floor((now.getTime() - accountCreated.getTime()) / (1000 * 60 * 60 * 24));
+
+    // Trouver la catégorie favorite
+    if (Object.keys(categoryCounts).length > 0) {
+      stats.favoriteCategory = Object.keys(categoryCounts).reduce((a, b) => 
+        categoryCounts[a] > categoryCounts[b] ? a : b
+      );
+    }
+
+    // Dernière activité
+    if (activities.length > 0) {
+      stats.lastActivityDate = activities[0].timestamp;
+    }
+
+    res.json({
+      stats
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de la récupération des statistiques:', error);
+    res.status(500).json({
+      error: 'Erreur interne du serveur'
+    });
+  }
+});
+
+// Route pour enregistrer une activité utilisateur
+app.post('/api/user/activity', authenticateToken, async (req, res) => {
+  try {
+    const { type, category, details } = req.body;
+    const userId = req.user._id;
+
+    // Validation du type d'activité
+    const validTypes = ['upload', 'download', 'contribution', 'login'];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({
+        error: 'Type d\'activité invalide'
+      });
+    }
+
+    // Créer la nouvelle activité
+    const activity = new Activity({
+      userId,
+      type,
+      category: category || null,
+      details: details || {}
+    });
+
+    await activity.save();
+
+    res.status(201).json({
+      message: 'Activité enregistrée avec succès',
+      activity: {
+        id: activity._id,
+        type: activity.type,
+        category: activity.category,
+        timestamp: activity.timestamp
+      }
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de l\'enregistrement de l\'activité:', error);
+    res.status(500).json({
+      error: 'Erreur interne du serveur'
+    });
+  }
+});
+
+// Route pour récupérer l'historique d'activités
+app.get('/api/user/activities', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { limit = 50, page = 1, type } = req.query;
+
+    // Construire la requête
+    const query = { userId };
+    if (type) {
+      query.type = type;
+    }
+
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const activities = await Activity.find(query)
+      .sort({ timestamp: -1 })
+      .limit(parseInt(limit))
+      .skip(skip)
+      .select('type category details timestamp');
+
+    const total = await Activity.countDocuments(query);
+
+    res.json({
+      activities,
+      pagination: {
+        current: parseInt(page),
+        total: Math.ceil(total / parseInt(limit)),
+        count: activities.length,
+        totalRecords: total
+      }
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de la récupération des activités:', error);
+    res.status(500).json({
+      error: 'Erreur interne du serveur'
+    });
+  }
+});
+
+// Route pour générer des données de test (à supprimer en production)
+app.post('/api/user/generate-test-data', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const categories = ['Musique', 'Vidéo', 'Documents', 'Images', 'Logiciels', 'Education', 'Gaming'];
+    const types = ['upload', 'download', 'contribution'];
+    
+    const activities = [];
+    
+    // Générer 100 activités aléatoires sur les 6 derniers mois
+    for (let i = 0; i < 100; i++) {
+      const randomDate = new Date();
+      randomDate.setDate(randomDate.getDate() - Math.floor(Math.random() * 180));
+      
+      activities.push({
+        userId,
+        type: types[Math.floor(Math.random() * types.length)],
+        category: categories[Math.floor(Math.random() * categories.length)],
+        timestamp: randomDate,
+        details: {
+          generated: true,
+          testData: true
+        }
+      });
+    }
+    
+    await Activity.insertMany(activities);
+    
+    res.json({
+      message: 'Données de test générées avec succès',
+      count: activities.length
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de la génération des données de test:', error);
     res.status(500).json({
       error: 'Erreur interne du serveur'
     });
@@ -476,7 +728,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     await user.save();
 
     // Ici, vous devriez envoyer un email avec le lien de réinitialisation
-    // Pour le moment, on simule juste l'envoi
     
     res.json({
       message: 'Si cet email existe dans notre système, vous recevrez un lien de réinitialisation'
@@ -490,6 +741,15 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
 });
 
+// Route test
+app.get("/api/health", (req, res) => {
+  res.json({ 
+    status: "OK", 
+    message: "Serveur opérationnel.",
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Connexion à MongoDB Atlas
 mongoose.connect(MONGO_URI)
   .then(() => {
@@ -499,21 +759,13 @@ mongoose.connect(MONGO_URI)
     app.listen(PORT, () => {
       console.log(`🚀 Serveur en ligne sur le port ${PORT}`);
       console.log(`🔒 JWT Secret configuré: ${JWT_SECRET ? 'Oui' : 'Non'}`);
+      console.log(`📊 Routes statistiques activées`);
     });
   })
   .catch((err) => {
     console.error("❌ Échec de connexion à MongoDB :", err.message);
     process.exit(1);
   });
-
-// Route test
-app.get("/api/health", (req, res) => {
-  res.json({ 
-    status: "OK", 
-    message: "Serveur opérationnel.",
-    timestamp: new Date().toISOString()
-  });
-});
 
 // Gestion des erreurs globales
 app.use((error, req, res, next) => {
